@@ -232,10 +232,25 @@ static void read_dirty_submit(struct closure *cl)
 	continue_at(cl, write_dirty, io->dc->writeback_write_wq);
 }
 
+static inline bool keys_contiguous(struct cached_dev *dc,
+		struct keybuf_key *first, struct keybuf_key *second)
+{
+	if (KEY_INODE(&second->key) != KEY_INODE(&first->key))
+		return false;
+
+	if (KEY_OFFSET(&second->key) !=
+			KEY_OFFSET(&first->key) + KEY_SIZE(&first->key))
+		return false;
+
+	return true;
+}
+
 static void read_dirty(struct cached_dev *dc)
 {
 	unsigned delay = 0;
-	struct keybuf_key *w;
+	struct keybuf_key *next, *keys[MAX_WRITEBACKS_IN_PASS], *w;
+	size_t size;
+	int nk, i;
 	struct dirty_io *io;
 	struct closure cl;
 
@@ -246,45 +261,87 @@ static void read_dirty(struct cached_dev *dc)
 	 * mempools.
 	 */
 
-	while (!kthread_should_stop()) {
+	next = bch_keybuf_next(&dc->writeback_keys);
 
-		w = bch_keybuf_next(&dc->writeback_keys);
-		if (!w)
-			break;
+	while (!kthread_should_stop() && next) {
+		size = 0;
+		nk = 0;
 
-		BUG_ON(ptr_stale(dc->disk.c, &w->key, 0));
+		do {
+			BUG_ON(ptr_stale(dc->disk.c, &next->key, 0));
 
-		if (KEY_START(&w->key) != dc->last_read ||
-		    jiffies_to_msecs(delay) > 50)
-			while (!kthread_should_stop() && delay)
-				delay = schedule_timeout_interruptible(delay);
+			/*
+			 * Don't combine too many operations, even if they
+			 * are all small.
+			 */
+			if (nk >= MAX_WRITEBACKS_IN_PASS)
+				break;
 
-		dc->last_read	= KEY_OFFSET(&w->key);
+			/*
+			 * If the current operation is very large, don't
+			 * further combine operations.
+			 */
+			if (size >= MAX_WRITESIZE_IN_PASS)
+				break;
 
-		io = kzalloc(sizeof(struct dirty_io) + sizeof(struct bio_vec)
-			     * DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS),
-			     GFP_KERNEL);
-		if (!io)
-			goto err;
+			/*
+			 * Operations are only eligible to be combined
+			 * if they are contiguous.
+			 *
+			 * TODO: add a heuristic willing to fire a
+			 * certain amount of non-contiguous IO per pass,
+			 * so that we can benefit from backing device
+			 * command queueing.
+			 */
+			if (nk != 0 && !keys_contiguous(dc, keys[nk-1], next))
+				break;
 
-		w->private	= io;
-		io->dc		= dc;
+			size += KEY_SIZE(&next->key);
+			keys[nk++] = next;
+		} while ((next = bch_keybuf_next(&dc->writeback_keys)));
 
-		dirty_init(w);
-		bio_set_op_attrs(&io->bio, REQ_OP_READ, 0);
-		io->bio.bi_iter.bi_sector = PTR_OFFSET(&w->key, 0);
-		bio_set_dev(&io->bio, PTR_CACHE(dc->disk.c, &w->key, 0)->bdev);
-		io->bio.bi_end_io	= read_dirty_endio;
+		/* Now we have gathered a set of 1..5 keys to write back. */
 
-		if (bio_alloc_pages(&io->bio, GFP_KERNEL))
-			goto err_free;
+		for (i = 0; i < nk; i++) {
+			w = keys[i];
 
-		trace_bcache_writeback(&w->key);
+			io = kzalloc(sizeof(struct dirty_io) +
+				     sizeof(struct bio_vec) *
+				     DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS),
+				     GFP_KERNEL);
+			if (!io)
+				goto err;
 
-		down(&dc->in_flight);
-		closure_call(&io->cl, read_dirty_submit, NULL, &cl);
+			w->private	= io;
+			io->dc		= dc;
 
-		delay = writeback_delay(dc, KEY_SIZE(&w->key));
+			dirty_init(w);
+			bio_set_op_attrs(&io->bio, REQ_OP_READ, 0);
+			io->bio.bi_iter.bi_sector = PTR_OFFSET(&w->key, 0);
+			bio_set_dev(&io->bio,
+				    PTR_CACHE(dc->disk.c, &w->key, 0)->bdev);
+			io->bio.bi_end_io	= read_dirty_endio;
+
+			if (bio_alloc_pages(&io->bio, GFP_KERNEL))
+				goto err_free;
+
+			trace_bcache_writeback(&w->key);
+
+			down(&dc->in_flight);
+
+			/* We've acquired a semaphore for the maximum
+			 * simultaneous number of writebacks; from here
+			 * everything happens asynchronously.
+			 */
+			closure_call(&io->cl, read_dirty_submit, NULL, &cl);
+		}
+
+		delay = writeback_delay(dc, size);
+
+		while (!kthread_should_stop() && delay) {
+			schedule_timeout_interruptible(delay);
+			delay = writeback_delay(dc, 0);
+		}
 	}
 
 	if (0) {
