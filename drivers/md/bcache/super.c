@@ -1117,12 +1117,10 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 	INIT_LIST_HEAD(&dc->list);
 	closure_init(&dc->disk.cl, NULL);
 	set_closure_fn(&dc->disk.cl, cached_dev_flush, system_wq);
-	kobject_init(&dc->disk.kobj, &bch_cached_dev_ktype);
 	INIT_WORK(&dc->detach, cached_dev_detach_finish);
 	sema_init(&dc->sb_write_mutex, 1);
 	INIT_LIST_HEAD(&dc->io_lru);
 	spin_lock_init(&dc->io_lock);
-	bch_cache_accounting_init(&dc->accounting, &dc->disk.cl);
 
 	dc->sequential_cutoff		= 4 << 20;
 
@@ -1148,6 +1146,10 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 
 	bch_cached_dev_request_init(dc);
 	bch_cached_dev_writeback_init(dc);
+	bch_cache_accounting_init(&dc->accounting, &dc->disk.cl);
+
+	kobject_init(&dc->disk.kobj, &bch_cached_dev_ktype);
+
 	return 0;
 }
 
@@ -1477,11 +1479,6 @@ struct cache_set *bch_cache_set_alloc(struct cache_sb *sb)
 	closure_set_stopped(&c->cl);
 	closure_put(&c->cl);
 
-	kobject_init(&c->kobj, &bch_cache_set_ktype);
-	kobject_init(&c->internal, &bch_cache_set_internal_ktype);
-
-	bch_cache_accounting_init(&c->accounting, &c->cl);
-
 	memcpy(c->sb.set_uuid, sb->set_uuid, 16);
 	c->sb.block_size	= sb->block_size;
 	c->sb.bucket_size	= sb->bucket_size;
@@ -1543,6 +1540,10 @@ struct cache_set *bch_cache_set_alloc(struct cache_sb *sb)
 	c->congested_read_threshold_us	= 2000;
 	c->congested_write_threshold_us	= 20000;
 	c->error_limit	= 8 << IO_ERROR_SHIFT;
+
+	kobject_init(&c->kobj, &bch_cache_set_ktype);
+	kobject_init(&c->internal, &bch_cache_set_internal_ktype);
+	bch_cache_accounting_init(&c->accounting, &c->cl);
 
 	return c;
 err:
@@ -1825,7 +1826,6 @@ static int cache_alloc(struct cache *ca)
 	struct bucket *b;
 
 	__module_get(THIS_MODULE);
-	kobject_init(&ca->kobj, &bch_cache_ktype);
 
 	bio_init(&ca->journal.bio, ca->journal.bio.bi_inline_vecs, 8);
 
@@ -1848,6 +1848,8 @@ static int cache_alloc(struct cache *ca)
 
 	for_each_bucket(b, ca)
 		atomic_set(&b->pin, 0);
+
+	kobject_init(&ca->kobj, &bch_cache_ktype);
 
 	return 0;
 }
