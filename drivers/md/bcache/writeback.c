@@ -24,10 +24,24 @@ static void __update_writeback_rate(struct cached_dev *dc)
 	struct cache_set *c = dc->disk.c;
 	uint64_t cache_sectors = c->nbuckets * c->sb.bucket_size -
 				bcache_flash_devs_sectors_dirty(c);
+	/*
+	 * Unfortunately we don't know the exact share of dirty data for
+	 * each backing device.  Therefore, we need to infer the writeback
+	 * for each disk based on its assumed proportion of dirty data.
+	 *
+	 * 16384 is chosen here as something that each backing device should
+	 * be a reasonable fraction of the share, and not to blow up until
+	 * individual backing devices are a petabyte.
+	 */
+	uint32_t bdev_share_per16k =
+		div64_u64(16384 * bdev_sectors(dc->bdev),
+				c->cached_dev_sectors);
+
 	uint64_t cache_dirty_target =
 		div_u64(cache_sectors * dc->writeback_percent, 100);
-	int64_t target = div64_u64(cache_dirty_target * bdev_sectors(dc->bdev),
-				   c->cached_dev_sectors);
+
+	int64_t target = div_u64(cache_dirty_target * bdev_share_per16k,
+			16384);
 
 	/*
 	 * PI controller:
