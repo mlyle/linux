@@ -26,16 +26,28 @@ static void __update_writeback_rate(struct cached_dev *dc)
 				bcache_flash_devs_sectors_dirty(c);
 	uint64_t cache_dirty_target =
 		div_u64(cache_sectors * dc->writeback_percent, 100);
-	int64_t target = div64_u64(cache_dirty_target * bdev_sectors(dc->bdev),
-				   c->cached_dev_sectors);
+
+	/*
+	 * 16384 is chosen here as something that each backing device should
+	 * be a reasonable fraction of the share, and to not blow up until
+	 * individual backing devices are a petabyte.
+	 */
+	uint32_t bdev_share_per16k =
+		div64_u64(16384 * bdev_sectors(dc->bdev),
+				c->cached_dev_sectors);
 
 	/*
 	 * PI controller:
 	 * Figures out the amount that should be written per second.
 	 *
 	 * First, the error (number of sectors that are dirty beyond our
-	 * target) is calculated.  The error is accumulated (numerically
-	 * integrated).
+	 * target) is calculated.
+	 *
+	 * Unfortunately we don't know the exact share of dirty data for
+	 * each backing device; therefore the error is adjusted for this
+	 * backing disk's share of the overall error based on size.
+	 *
+	 * The error is accumulated (numerically integrated).
 	 *
 	 * Then, the proportional value and integral value are scaled
 	 * based on configured values.  These are stored as inverses to
@@ -50,11 +62,21 @@ static void __update_writeback_rate(struct cached_dev *dc)
 	 * variations in usage like the p term.
 	 */
 	int64_t dirty = bcache_dev_sectors_dirty(&dc->disk);
-	int64_t error = dirty - target;
-	int64_t proportional_scaled =
-		div_s64(error, dc->writeback_rate_p_term_inverse);
-	int64_t integral_scaled;
+	int64_t error = dirty - cache_dirty_target;
+	int64_t proportional_scaled, integral_scaled;
 	uint32_t new_rate;
+
+	/*
+	 * Ensure even with large device size disparities that we still
+	 * writeback at least some.
+	 */
+	if (bdev_share_per16k < 1)
+		bdev_share_per16k = 1;
+
+	error = div_s64(error * bdev_share_per16k, 16384);
+
+	proportional_scaled = div_s64(error,
+			dc->writeback_rate_p_term_inverse);
 
 	if ((error < 0 && dc->writeback_rate_integral > 0) ||
 	    (error > 0 && time_before64(local_clock(),
@@ -83,7 +105,7 @@ static void __update_writeback_rate(struct cached_dev *dc)
 	dc->writeback_rate_integral_scaled = integral_scaled;
 	dc->writeback_rate_change = new_rate - dc->writeback_rate.rate;
 	dc->writeback_rate.rate = new_rate;
-	dc->writeback_rate_target = target;
+	dc->writeback_rate_target = cache_dirty_target;
 }
 
 static void update_writeback_rate(struct work_struct *work)
