@@ -543,11 +543,11 @@ static int bch_writeback_thread(void *arg)
 		    (!test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) &&
 		     !dc->writeback_running)) {
 			up_write(&dc->writeback_lock);
-			set_current_state(TASK_INTERRUPTIBLE);
 
 			if (kthread_should_stop())
 				return 0;
 
+			set_current_state(TASK_INTERRUPTIBLE);
 			schedule();
 			continue;
 		}
