@@ -282,7 +282,6 @@ static void invalidate_buckets(struct cache *ca)
 #define allocator_wait(ca, cond)					\
 do {									\
 	while (1) {							\
-		set_current_state(TASK_INTERRUPTIBLE);			\
 		if (cond)						\
 			break;						\
 									\
@@ -290,10 +289,10 @@ do {									\
 		if (kthread_should_stop())				\
 			return 0;					\
 									\
+		set_current_state(TASK_INTERRUPTIBLE);			\
 		schedule();						\
 		mutex_lock(&(ca)->set->bucket_lock);			\
 	}								\
-	__set_current_state(TASK_RUNNING);				\
 } while (0)
 
 static int bch_allocator_push(struct cache *ca, long bucket)
