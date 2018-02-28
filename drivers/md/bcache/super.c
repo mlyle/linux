@@ -1000,6 +1000,7 @@ int bch_cached_dev_attach(struct cached_dev *dc, struct cache_set *c,
 	uint32_t rtime = cpu_to_le32(get_seconds());
 	struct uuid_entry *u;
 	char buf[BDEVNAME_SIZE];
+	struct cached_dev *exist_dc, *t;
 
 	bdevname(dc->bdev, buf);
 
@@ -1024,6 +1025,16 @@ int bch_cached_dev_attach(struct cached_dev *dc, struct cache_set *c,
 		return -EINVAL;
 	}
 
+	/* Check whether already attached */
+	list_for_each_entry_safe(exist_dc, t, &c->cached_devs, list) {
+		if (!memcmp(dc->sb.uuid, exist_dc->sb.uuid, 16)) {
+			pr_err("Tried to attach %s but duplicate UUID already attached",
+				buf);
+
+			return -EINVAL;
+		}
+	}
+
 	u = uuid_find(c, dc->sb.uuid);
 
 	if (u &&
@@ -1045,6 +1056,7 @@ int bch_cached_dev_attach(struct cached_dev *dc, struct cache_set *c,
 			pr_err("Not caching %s, no room for UUID", buf);
 			return -EINVAL;
 		}
+	} else {
 	}
 
 	/* Deadlocks since we're called via sysfs...
@@ -1214,6 +1226,16 @@ static void register_bdev(struct cache_sb *sb, struct page *sb_page,
 	char name[BDEVNAME_SIZE];
 	const char *err = "cannot allocate memory";
 	struct cache_set *c;
+	struct cached_dev *exist_dc, *t;
+
+	/* Check whether another unattached with same UUID. */
+	list_for_each_entry_safe(exist_dc, t, &uncached_devices, list) {
+		if (!memcmp(sb->uuid, exist_dc->sb.uuid, 16)) {
+			err = "duplicate UUID of backing device";
+
+			goto err;
+		}
+	}
 
 	memcpy(&dc->sb, sb, sizeof(struct cache_sb));
 	dc->bdev = bdev;
@@ -1233,11 +1255,20 @@ static void register_bdev(struct cache_sb *sb, struct page *sb_page,
 	if (bch_cache_accounting_add_kobjs(&dc->accounting, &dc->disk.kobj))
 		goto err;
 
+	list_add(&dc->list, &uncached_devices);
 	pr_info("registered backing device %s", bdevname(bdev, name));
 
-	list_add(&dc->list, &uncached_devices);
-	list_for_each_entry(c, &bch_cache_sets, list)
-		bch_cached_dev_attach(dc, c, NULL);
+	list_for_each_entry(c, &bch_cache_sets, list) {
+		int ret = bch_cached_dev_attach(dc, c, NULL);
+
+		if (ret == 0)
+			break;
+
+		if (ret != -ENOENT) {
+			err = "fatal error when attaching";
+			goto err;
+		}
+	}
 
 	if (BDEV_STATE(&dc->sb) == BDEV_STATE_NONE ||
 	    BDEV_STATE(&dc->sb) == BDEV_STATE_STALE)
